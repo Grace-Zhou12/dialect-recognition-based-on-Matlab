@@ -1,0 +1,1418 @@
+function shanghai_dialect_recognition_optimized()
+    params = init_parameters();
+    params = load_existing_model(params);
+
+    while true
+        fprintf('\n=== Optimized Shanghai Dialect Recognition ===\n');
+        fprintf('1. Train and evaluate model\n');
+        fprintf('2. Predict one audio file\n');
+        fprintf('3. Show model summary\n');
+        fprintf('4. Exit\n');
+
+        choice = input('Please select (1-4): ', 's');
+
+        switch choice
+            case '1'
+                params = train_and_evaluate_system(params);
+            case '2'
+                predict_one_file(params);
+            case '3'
+                show_model_summary(params);
+            case '4'
+                fprintf('Exiting system\n');
+                break;
+            otherwise
+                fprintf('Invalid selection\n');
+        end
+    end
+end
+
+function params = init_parameters()
+    root_dir = fileparts(mfilename('fullpath'));
+
+    params.fs = 16000;
+    params.frame_len = 0.025;
+    params.hop_len = 0.010;
+    params.min_duration = 1.0;
+    params.random_seed = 42;
+    params.test_ratio = 0.30;
+    params.k_folds = 5;
+    params.dataset_dir = fullfile(root_dir, 'training_data');
+    params.model_file = fullfile(root_dir, 'shanghai_optimized_model.mat');
+    params.file_index_path = fullfile(root_dir, 'public_dataset', 'processed', 'metadata', 'file_index.csv');
+    params.feature_cache_file = fullfile(root_dir, 'public_dataset', 'processed', 'metadata', 'feature_cache.mat');
+    params.split_ratios = [0.70, 0.15, 0.15]; % train/val/test
+    params.balance_training = false; % set true to downsample for balance
+    params.max_samples_per_class = inf; % set a number to cap per class
+    params.min_eval_pos = 30;
+    params.min_eval_neg = 30;
+    params.use_mfcc = exist('mfcc', 'file') == 2;
+    params.mfcc_coeffs = 13;
+    params.feature_names = build_feature_names(params.use_mfcc, params.mfcc_coeffs);
+    params.keep_publication_figure = true;
+
+    params.model_info = struct();
+    params.model_info.last_trained = 'Never trained';
+    params.model_info.best_model = 'Not available';
+    params.model_info.num_samples = 0;
+    params.model_info.test_f1 = 0;
+end
+
+function params = load_existing_model(params)
+    if exist(params.model_file, 'file')
+        loaded = load(params.model_file);
+        if isfield(loaded, 'stored')
+            params.stored = loaded.stored;
+            params.model_info = loaded.stored.model_info;
+            fprintf('Loaded optimized model from disk.\n');
+        end
+    end
+end
+
+function params = train_and_evaluate_system(params)
+    rng(params.random_seed);
+
+    [file_paths, labels, speaker_ids, split_tags] = load_from_file_index(params.file_index_path);
+    if isempty(file_paths)
+        [file_paths, labels] = collect_dataset(params.dataset_dir);
+        speaker_ids = repmat({''}, size(labels));
+        split_tags = repmat({''}, size(labels));
+    end
+    if isempty(file_paths)
+        fprintf('No training data found.\n');
+        return;
+    end
+
+    [features, valid_labels, valid_paths, valid_speakers, valid_splits, stats] = ...
+        build_feature_matrix(file_paths, labels, params, speaker_ids, split_tags);
+    if size(features, 1) < 6
+        fprintf('Not enough valid samples for training.\n');
+        return;
+    end
+    print_ingest_stats(stats, numel(file_paths), sum(valid_labels==1), sum(valid_labels==0));
+
+    [features, valid_labels, valid_paths, valid_speakers, valid_splits] = ...
+        subsample_by_class(features, valid_labels, valid_paths, valid_speakers, valid_splits, params.max_samples_per_class, params.random_seed);
+
+    class_values = unique(valid_labels(:))';
+    for c = class_values
+        if sum(valid_labels == c) < 2
+            fprintf('Each class needs at least 2 valid samples.\n');
+            return;
+        end
+    end
+
+    if any(~cellfun(@isempty, valid_splits)) && splits_are_usable(valid_labels, valid_splits, params)
+        [train_idx, val_idx, test_idx] = split_from_tags(valid_splits);
+    else
+        [train_idx, val_idx, test_idx] = split_by_speaker(valid_labels, valid_speakers, params.split_ratios, params.random_seed);
+        [train_idx, val_idx, test_idx] = enforce_min_class_counts(valid_labels, train_idx, val_idx, test_idx, params.min_eval_pos, params.min_eval_neg, params.random_seed);
+        write_splits_to_index(params.file_index_path, valid_paths, train_idx, val_idx, test_idx);
+    end
+    if sum(test_idx) == 0
+        [train_idx, test_idx] = stratified_holdout(valid_labels, params.test_ratio, params.random_seed);
+        val_idx = false(size(valid_labels));
+    end
+    print_split_stats(valid_labels, train_idx, val_idx, test_idx);
+
+    X_train = features(train_idx, :);
+    y_train = valid_labels(train_idx);
+    X_val = features(val_idx, :);
+    y_val = valid_labels(val_idx);
+    X_test = features(test_idx, :);
+    y_test = valid_labels(test_idx);
+
+    train_select_idx = train_idx | val_idx;
+    X_select = features(train_select_idx, :);
+    y_select = valid_labels(train_select_idx);
+
+    sample_weights = compute_sample_weights(y_train);
+    if params.balance_training
+        [X_train, y_train, sample_weights] = balance_training_data(X_train, y_train, params.random_seed);
+    end
+
+    stats.mean = mean(X_train, 1);
+    stats.std = std(X_train, 0, 1);
+    stats.std(stats.std == 0) = 1;
+
+    X_train_n = normalize_features(X_train, stats);
+    X_val_n = normalize_features(X_val, stats);
+    X_test_n = normalize_features(X_test, stats);
+
+    candidate_models = train_candidate_models(X_train_n, y_train, sample_weights);
+    if isempty(candidate_models)
+        fprintf('Failed to train any model.\n');
+        return;
+    end
+
+    best_idx = 1;
+    best_f1 = -inf;
+    summaries = cell(numel(candidate_models), 1);
+    use_validation = any(val_idx);
+
+    for i = 1:numel(candidate_models)
+        if use_validation
+            y_pred = predict_with_model(candidate_models{i}, X_val_n);
+            metrics = compute_metrics(y_val, y_pred);
+            selection_label = 'Validation';
+        else
+            metrics = struct();
+            metrics.f1 = approximate_cross_validation(candidate_models{i}.name, X_train_n, y_train, sample_weights, params.k_folds, params.random_seed);
+            selection_label = sprintf('Approx. %d-fold CV', params.k_folds);
+        end
+        cv_f1 = approximate_cross_validation(candidate_models{i}.name, X_train_n, y_train, sample_weights, params.k_folds, params.random_seed);
+
+        summaries{i} = struct();
+        summaries{i}.name = candidate_models{i}.name;
+        summaries{i}.metrics = metrics;
+        summaries{i}.cv_f1 = cv_f1;
+
+        fprintf('\nModel: %s\n', candidate_models{i}.name);
+        if use_validation
+            fprintf('Validation Accuracy: %.3f\n', metrics.accuracy);
+            fprintf('Validation Precision: %.3f\n', metrics.precision);
+            fprintf('Validation Recall: %.3f\n', metrics.recall);
+            fprintf('Validation F1: %.3f\n', metrics.f1);
+        else
+            fprintf('%s F1: %.3f\n', selection_label, metrics.f1);
+        end
+        fprintf('Approx. %d-fold CV F1: %.3f\n', params.k_folds, cv_f1);
+
+        if metrics.f1 > best_f1
+            best_f1 = metrics.f1;
+            best_idx = i;
+        end
+    end
+
+    stats.mean = mean(X_select, 1);
+    stats.std = std(X_select, 0, 1);
+    stats.std(stats.std == 0) = 1;
+    X_select_n = normalize_features(X_select, stats);
+    X_test_n = normalize_features(X_test, stats);
+    select_weights = compute_sample_weights(y_select);
+    if params.balance_training
+        [X_select_n, y_select, select_weights] = balance_training_data(X_select_n, y_select, params.random_seed);
+    end
+
+    best_model_name = candidate_models{best_idx}.name;
+    best_model = train_model_by_name(best_model_name, X_select_n, y_select, select_weights);
+    best_predictions = predict_with_model(best_model, X_test_n);
+    best_metrics = compute_metrics(y_test, best_predictions);
+
+    stored = struct();
+    stored.model = best_model;
+    stored.normalization = stats;
+    stored.feature_names = params.feature_names;
+    stored.model_summaries = summaries;
+    stored.train_paths = valid_paths(train_idx);
+    stored.test_paths = valid_paths(test_idx);
+    stored.model_info = struct();
+    stored.model_info.last_trained = datestr(now);
+    stored.model_info.best_model = best_model.name;
+    stored.model_info.num_samples = numel(valid_labels);
+    stored.model_info.selection_metric = ternary(use_validation, 'validation_f1', 'cross_validation_f1');
+    stored.model_info.test_f1 = best_metrics.f1;
+    stored.model_info.test_accuracy = best_metrics.accuracy;
+    stored.model_info.confusion_matrix = [best_metrics.tp, best_metrics.fn; best_metrics.fp, best_metrics.tn];
+
+    save(params.model_file, 'stored');
+    params.stored = stored;
+    params.model_info = stored.model_info;
+
+    fprintf('\nBest model saved: %s\n', best_model.name);
+    fprintf('Model file: %s\n', params.model_file);
+
+    show_evaluation_report(best_model, best_metrics, params.feature_names);
+    test_scores = score_with_model(best_model, X_test_n);
+    generate_publication_figures(params, X_test_n, y_test, best_predictions, test_scores, best_model.name, best_metrics, summaries);
+end
+
+function print_split_stats(labels, train_idx, val_idx, test_idx)
+    fprintf('\n=== Split Statistics ===\n');
+    print_one_split('Train', labels, train_idx);
+    print_one_split('Val', labels, val_idx);
+    print_one_split('Test', labels, test_idx);
+end
+
+function print_one_split(name, labels, mask)
+    n = sum(mask);
+    n_pos = sum(labels(mask) == 1);
+    n_neg = sum(labels(mask) == 0);
+    if n == 0
+        fprintf('%s: 0 samples\n', name);
+        return;
+    end
+    fprintf('%s: %d samples | shanghai=%d | non_shanghai=%d\n', name, n, n_pos, n_neg);
+end
+
+function predict_one_file(params)
+    if ~isfield(params, 'stored')
+        fprintf('No optimized model available. Train the model first.\n');
+        return;
+    end
+
+    [file, path] = uigetfile({'*.wav;*.mp3', 'Audio Files'}, 'Select one audio file');
+    if isequal(file, 0)
+        fprintf('No file selected\n');
+        return;
+    end
+
+    filename = fullfile(path, file);
+    feature_vector = extract_features_from_file(filename, params);
+    if isempty(feature_vector)
+        fprintf('Failed to extract features from %s\n', filename);
+        return;
+    end
+
+    X = normalize_features(feature_vector, params.stored.normalization);
+    y_pred = predict_with_model(params.stored.model, X);
+    score = score_with_model(params.stored.model, X);
+
+    if y_pred == 1
+        label_text = 'Shanghai dialect';
+    else
+        label_text = 'Non-Shanghai speech';
+    end
+
+    fprintf('\nPrediction result: %s\n', label_text);
+    fprintf('Decision score: %.3f\n', score);
+    disp_feature_vector(feature_vector, params.feature_names);
+end
+
+function show_model_summary(params)
+    if ~isfield(params, 'stored')
+        fprintf('No optimized model is stored yet.\n');
+        return;
+    end
+
+    info = params.stored.model_info;
+    fprintf('\n=== Optimized Model Summary ===\n');
+    fprintf('Last trained: %s\n', info.last_trained);
+    fprintf('Best model: %s\n', info.best_model);
+    fprintf('Samples used: %d\n', info.num_samples);
+    fprintf('Test accuracy: %.3f\n', info.test_accuracy);
+    fprintf('Test F1: %.3f\n', info.test_f1);
+    fprintf('Feature set:\n');
+    for i = 1:numel(params.stored.feature_names)
+        fprintf('  %s\n', params.stored.feature_names{i});
+    end
+end
+
+function [file_paths, labels] = collect_dataset(dataset_dir)
+    file_paths = {};
+    labels = [];
+
+    class_names = {'shanghai', 'non_shanghai'};
+    class_labels = [1, 0];
+
+    for i = 1:numel(class_names)
+        class_dir = fullfile(dataset_dir, class_names{i});
+        if ~exist(class_dir, 'dir')
+            continue;
+        end
+
+        wav_files = dir(fullfile(class_dir, '*.wav'));
+        for j = 1:numel(wav_files)
+            file_paths{end + 1, 1} = fullfile(class_dir, wav_files(j).name);
+            labels(end + 1, 1) = class_labels(i);
+        end
+    end
+end
+
+function [features, labels, paths, speakers, splits, stats] = build_feature_matrix(file_paths, raw_labels, params, raw_speakers, raw_splits)
+    stats = struct('read_fail', 0, 'too_short', 0, 'invalid_feat', 0, 'cache_hit', 0, 'cache_miss', 0);
+    cache = load_feature_cache(params.feature_cache_file);
+    n_files = numel(file_paths);
+    n_features = numel(params.feature_names);
+    feature_cells = cell(n_files, 1);
+    status_list = strings(n_files, 1);
+
+    for i = 1:n_files
+        [one_feature, status, cache, hit] = get_cached_or_extract_feature(file_paths{i}, params, cache);
+        if hit
+            stats.cache_hit = stats.cache_hit + 1;
+        else
+            stats.cache_miss = stats.cache_miss + 1;
+        end
+        if ~isempty(one_feature)
+            feature_cells{i} = reshape(one_feature, 1, []);
+        end
+        status_list(i) = string(status);
+    end
+    save_feature_cache(params.feature_cache_file, cache);
+
+    valid_mask = ~cellfun(@isempty, feature_cells);
+    features = zeros(sum(valid_mask), n_features);
+    valid_indices = find(valid_mask);
+    for i = 1:numel(valid_indices)
+        features(i, :) = feature_cells{valid_indices(i)};
+    end
+    labels = raw_labels(valid_mask);
+    paths = file_paths(valid_mask);
+    if nargin >= 4
+        speakers = raw_speakers(valid_mask);
+        splits = raw_splits(valid_mask);
+    else
+        speakers = repmat({''}, sum(valid_mask), 1);
+        splits = repmat({''}, sum(valid_mask), 1);
+    end
+
+    stats.read_fail = sum(status_list == "read_fail");
+    stats.too_short = sum(status_list == "too_short");
+    stats.invalid_feat = sum(status_list == "invalid_feat");
+end
+
+function [feature_vector, status] = extract_features_from_file(filename, params)
+    feature_vector = [];
+    status = "read_fail";
+
+    try
+        [audio, fs] = audioread(filename);
+        if size(audio, 2) > 1
+            audio = mean(audio, 2);
+        end
+
+        if numel(audio) / fs < params.min_duration
+            status = "too_short";
+            return;
+        end
+
+        if fs ~= params.fs
+            audio = resample(audio, params.fs, fs);
+            fs = params.fs;
+        end
+
+        audio = audio ./ max(max(abs(audio)), eps);
+        audio = trim_silence(audio);
+
+        low_freq_ratio = get_low_frequency_ratio(audio, fs);
+        [~, pitch_variance] = get_pitch_features(audio, fs, params);
+        zcr = get_zero_crossing_rate(audio);
+        energy_variance = get_energy_variance(audio, fs, params);
+        spectral_centroid = get_spectral_centroid(audio, fs);
+        spectral_flux = get_spectral_flux(audio, fs, params);
+
+        feature_vector = [ ...
+            low_freq_ratio, ...
+            pitch_variance, ...
+            zcr, ...
+            energy_variance, ...
+            spectral_centroid, ...
+            spectral_flux];
+
+        if params.use_mfcc
+            mfcc_features = compute_mfcc_features(audio, fs, params.mfcc_coeffs);
+            feature_vector = [feature_vector, mfcc_features];
+        end
+
+        if any(isnan(feature_vector)) || any(isinf(feature_vector))
+            feature_vector = [];
+            status = "invalid_feat";
+        else
+            status = "ok";
+        end
+    catch
+        feature_vector = [];
+    end
+end
+
+function Xn = normalize_features(X, stats)
+    Xn = (X - stats.mean) ./ stats.std;
+    Xn(isnan(Xn)) = 0;
+    Xn(isinf(Xn)) = 0;
+end
+
+function models = train_candidate_models(X, y, weights)
+    models = {};
+
+    threshold_model = train_threshold_baseline(X, y);
+    models{end + 1} = threshold_model;
+
+    try
+        mdl = fitclinear(X, y, 'Learner', 'logistic', 'Regularization', 'ridge', 'Weights', weights);
+        models{end + 1} = wrap_fitc_model('logistic_regression', mdl);
+    catch
+    end
+
+    try
+        mdl = fitcsvm(X, y, 'KernelFunction', 'rbf', 'Standardize', false, 'Weights', weights);
+        models{end + 1} = wrap_fitc_model('svm_rbf', mdl);
+    catch
+    end
+
+    try
+        mdl = fitcdiscr(X, y, 'Weights', weights);
+        models{end + 1} = wrap_fitc_model('lda', mdl);
+    catch
+    end
+end
+
+function model = train_model_by_name(model_name, X, y, weights)
+    switch model_name
+        case 'weighted_threshold'
+            model = train_threshold_baseline(X, y);
+        case 'logistic_regression'
+            mdl = fitclinear(X, y, 'Learner', 'logistic', 'Regularization', 'ridge', 'Weights', weights);
+            model = wrap_fitc_model(model_name, mdl);
+        case 'svm_rbf'
+            mdl = fitcsvm(X, y, 'KernelFunction', 'rbf', 'Standardize', false, 'Weights', weights);
+            model = wrap_fitc_model(model_name, mdl);
+        case 'lda'
+            mdl = fitcdiscr(X, y, 'Weights', weights);
+            model = wrap_fitc_model(model_name, mdl);
+        otherwise
+            error('Unknown model name: %s', model_name);
+    end
+end
+
+function model = wrap_fitc_model(name, mdl)
+    model = struct('name', name, 'type', 'fitc', 'mdl', mdl);
+    try
+        class_names = double(mdl.ClassNames(:)');
+    catch
+        class_names = [0 1];
+    end
+    model.class_names = class_names;
+    model.positive_class = 1;
+    pos_idx = find(class_names == 1, 1);
+    if isempty(pos_idx)
+        pos_idx = numel(class_names);
+    end
+    model.positive_index = pos_idx;
+    model.decision_threshold = 0;
+end
+
+function model = train_threshold_baseline(X, y)
+    pos = X(y == 1, :);
+    neg = X(y == 0, :);
+
+    pos_mean = mean(pos, 1);
+    neg_mean = mean(neg, 1);
+    separation = abs(pos_mean - neg_mean);
+    if sum(separation) == 0
+        weights = ones(1, size(X, 2)) / size(X, 2);
+    else
+        weights = separation / sum(separation);
+    end
+
+    thresholds = (pos_mean + neg_mean) / 2;
+    directions = ones(1, size(X, 2));
+    directions(pos_mean < neg_mean) = -1;
+
+    model = struct();
+    model.name = 'weighted_threshold';
+    model.type = 'threshold';
+    model.thresholds = thresholds;
+    model.directions = directions;
+    model.weights = weights;
+end
+
+function y_pred = predict_with_model(model, X)
+    switch model.type
+        case 'fitc'
+            y_pred = predict(model.mdl, X);
+        case 'threshold'
+            scores = score_threshold_model(model, X);
+            y_pred = double(scores >= 0.5);
+        otherwise
+            error('Unknown model type.');
+    end
+
+    y_pred = double(y_pred(:));
+end
+
+function score = score_with_model(model, X)
+    switch model.type
+        case 'fitc'
+            try
+                [~, score_matrix] = predict(model.mdl, X);
+                if size(score_matrix, 2) >= model.positive_index
+                    score = score_matrix(:, model.positive_index);
+                else
+                    score = score_matrix(:, 1);
+                end
+            catch
+                score = double(predict(model.mdl, X));
+            end
+        case 'threshold'
+            score = score_threshold_model(model, X);
+        otherwise
+            score = zeros(size(X, 1), 1);
+    end
+end
+
+function scores = score_threshold_model(model, X)
+    scores = zeros(size(X, 1), 1);
+    for i = 1:size(X, 1)
+        total = 0;
+        for j = 1:size(X, 2)
+            if model.directions(j) == 1
+                total = total + model.weights(j) * double(X(i, j) >= model.thresholds(j));
+            else
+                total = total + model.weights(j) * double(X(i, j) <= model.thresholds(j));
+            end
+        end
+        scores(i) = total;
+    end
+end
+
+function metrics = compute_metrics(y_true, y_pred)
+    tp = sum(y_pred == 1 & y_true == 1);
+    fp = sum(y_pred == 1 & y_true == 0);
+    tn = sum(y_pred == 0 & y_true == 0);
+    fn = sum(y_pred == 0 & y_true == 1);
+
+    metrics = struct();
+    metrics.tp = tp;
+    metrics.fp = fp;
+    metrics.tn = tn;
+    metrics.fn = fn;
+    metrics.accuracy = (tp + tn) / max(numel(y_true), 1);
+    metrics.precision = tp / max(tp + fp, 1);
+    metrics.recall = tp / max(tp + fn, 1);
+    metrics.f1 = 2 * metrics.precision * metrics.recall / max(metrics.precision + metrics.recall, eps);
+end
+
+function mean_f1 = approximate_cross_validation(model_name, X, y, weights, k_folds, seed)
+    rng(seed);
+    class_counts = arrayfun(@(c) sum(y == c), unique(y(:))');
+    effective_folds = max(2, min([k_folds, class_counts]));
+    fold_ids = stratified_kfold(y, effective_folds);
+    fold_f1 = zeros(effective_folds, 1);
+
+    for fold = 1:effective_folds
+        train_mask = fold_ids ~= fold;
+        test_mask = fold_ids == fold;
+
+        if sum(test_mask) == 0 || sum(train_mask) == 0
+            continue;
+        end
+
+        models = train_candidate_models(X(train_mask, :), y(train_mask), weights(train_mask));
+        selected = [];
+        for i = 1:numel(models)
+            if strcmp(models{i}.name, model_name)
+                selected = models{i};
+                break;
+            end
+        end
+
+        if isempty(selected)
+            selected = models{1};
+        end
+
+        y_pred = predict_with_model(selected, X(test_mask, :));
+        metrics = compute_metrics(y(test_mask), y_pred);
+        fold_f1(fold) = metrics.f1;
+    end
+
+    mean_f1 = mean(fold_f1);
+end
+
+function [train_idx, test_idx] = stratified_holdout(labels, test_ratio, seed)
+    rng(seed);
+    train_idx = false(size(labels));
+    test_idx = false(size(labels));
+
+    classes = unique(labels(:))';
+    for c = classes
+        idx = find(labels == c);
+        idx = idx(randperm(numel(idx)));
+        n_test = round(numel(idx) * test_ratio);
+        n_test = max(1, n_test);
+        n_test = min(n_test, numel(idx) - 1);
+        if n_test < 1
+            n_test = 1;
+        end
+        test_idx(idx(1:n_test)) = true;
+        train_idx(idx(n_test + 1:end)) = true;
+    end
+end
+
+function fold_ids = stratified_kfold(labels, k_folds)
+    fold_ids = zeros(size(labels));
+    classes = unique(labels(:))';
+
+    for c = classes
+        idx = find(labels == c);
+        idx = idx(randperm(numel(idx)));
+        for i = 1:numel(idx)
+            fold_ids(idx(i)) = mod(i - 1, k_folds) + 1;
+        end
+    end
+end
+
+function show_evaluation_report(model, metrics, feature_names)
+    fprintf('\n=== Final Evaluation Report ===\n');
+    fprintf('Selected model: %s\n', model.name);
+    fprintf('Accuracy: %.3f\n', metrics.accuracy);
+    fprintf('Precision: %.3f\n', metrics.precision);
+    fprintf('Recall: %.3f\n', metrics.recall);
+    fprintf('F1 score: %.3f\n', metrics.f1);
+    fprintf('Confusion matrix:\n');
+    fprintf('  TP: %d  FN: %d\n', metrics.tp, metrics.fn);
+    fprintf('  FP: %d  TN: %d\n', metrics.fp, metrics.tn);
+    fprintf('Features used:\n');
+    for i = 1:numel(feature_names)
+        fprintf('  %s\n', feature_names{i});
+    end
+end
+
+function disp_feature_vector(feature_vector, feature_names)
+    fprintf('Feature vector:\n');
+    for i = 1:numel(feature_names)
+        fprintf('  %-18s %.4f\n', feature_names{i}, feature_vector(i));
+    end
+end
+
+function low_freq_ratio = get_low_frequency_ratio(audio, fs)
+    n_fft = min(2048, numel(audio));
+    if n_fft < 256
+        low_freq_ratio = 0.3;
+        return;
+    end
+
+    frame = audio(1:n_fft) .* hamming(n_fft);
+    spectrum = abs(fft(frame, n_fft));
+    half_spectrum = spectrum(1:floor(n_fft / 2));
+    freqs = (0:numel(half_spectrum) - 1) * fs / n_fft;
+    mask = freqs >= 80 & freqs <= 400;
+
+    total_energy = sum(half_spectrum) + eps;
+    low_freq_ratio = sum(half_spectrum(mask)) / total_energy;
+end
+
+function [pitch_mean, pitch_variance] = get_pitch_features(audio, fs, params)
+    frame_size = round(params.frame_len * fs);
+    hop_size = round(params.hop_len * fs);
+    num_frames = floor((numel(audio) - frame_size) / hop_size) + 1;
+    num_frames = max(num_frames, 0);
+    max_frames = min(num_frames, 40);
+    pitches = [];
+
+    for i = 1:max_frames
+        start_idx = (i - 1) * hop_size + 1;
+        stop_idx = start_idx + frame_size - 1;
+        if stop_idx > numel(audio)
+            break;
+        end
+
+        frame = audio(start_idx:stop_idx);
+        pitch = estimate_pitch_simple(frame, fs);
+        if pitch >= 80 && pitch <= 400
+            pitches(end + 1) = pitch; %#ok<AGROW>
+        end
+    end
+
+    if numel(pitches) >= 3
+        pitch_mean = mean(pitches);
+        pitch_variance = std(pitches);
+    else
+        pitch_mean = 180;
+        pitch_variance = 35;
+    end
+end
+
+function pitch = estimate_pitch_simple(frame, fs)
+    frame = frame - mean(frame);
+    if norm(frame) < eps
+        pitch = 0;
+        return;
+    end
+
+    acf = xcorr(frame, 'coeff');
+    acf = acf(numel(frame):end);
+    min_lag = floor(fs / 400);
+    max_lag = ceil(fs / 80);
+    max_lag = min(max_lag, numel(acf));
+
+    if min_lag >= max_lag
+        pitch = 0;
+        return;
+    end
+
+    search_acf = acf(min_lag:max_lag);
+    [peak_value, peak_idx] = max(search_acf);
+    if peak_value < 0.2
+        pitch = 0;
+        return;
+    end
+
+    lag = peak_idx + min_lag - 1;
+    pitch = fs / lag;
+end
+
+function zcr = get_zero_crossing_rate(audio)
+    zcr = sum(abs(diff(audio > 0))) / max(numel(audio), 1);
+end
+
+function energy_variance = get_energy_variance(audio, fs, params)
+    frame_size = round(params.frame_len * fs);
+    hop_size = round(params.hop_len * fs);
+    num_frames = floor((numel(audio) - frame_size) / hop_size) + 1;
+    num_frames = max(num_frames, 0);
+    num_frames = min(num_frames, 30);
+
+    if num_frames < 2
+        energy_variance = 0.1;
+        return;
+    end
+
+    energies = zeros(1, num_frames);
+    for i = 1:num_frames
+        start_idx = (i - 1) * hop_size + 1;
+        stop_idx = start_idx + frame_size - 1;
+        frame = audio(start_idx:stop_idx);
+        energies(i) = mean(frame .^ 2);
+    end
+
+    energies = energies ./ max(max(energies), eps);
+    energy_variance = var(energies);
+end
+
+function spectral_centroid = get_spectral_centroid(audio, fs)
+    n_fft = min(2048, numel(audio));
+    if n_fft < 256
+        spectral_centroid = 1500;
+        return;
+    end
+
+    frame = audio(1:n_fft) .* hamming(n_fft);
+    spectrum = abs(fft(frame, n_fft));
+    half_spectrum = spectrum(1:floor(n_fft / 2));
+    freqs = (0:numel(half_spectrum) - 1) * fs / n_fft;
+    spectral_centroid = sum(freqs(:) .* half_spectrum(:)) / (sum(half_spectrum) + eps);
+end
+
+function spectral_flux = get_spectral_flux(audio, fs, params)
+    frame_size = round(params.frame_len * fs);
+    hop_size = round(params.hop_len * fs);
+    num_frames = floor((numel(audio) - frame_size) / hop_size) + 1;
+    num_frames = min(max(num_frames, 0), 20);
+
+    if num_frames < 2
+        spectral_flux = 0;
+        return;
+    end
+
+    prev_mag = [];
+    flux_values = zeros(1, num_frames - 1);
+
+    for i = 1:num_frames
+        start_idx = (i - 1) * hop_size + 1;
+        stop_idx = start_idx + frame_size - 1;
+        frame = audio(start_idx:stop_idx) .* hamming(frame_size);
+        magnitude = abs(fft(frame));
+        magnitude = magnitude(1:floor(numel(magnitude) / 2));
+        magnitude = magnitude / (sum(magnitude) + eps);
+
+        if ~isempty(prev_mag)
+            flux_values(i - 1) = sum((magnitude - prev_mag) .^ 2);
+        end
+        prev_mag = magnitude;
+    end
+
+    spectral_flux = mean(flux_values);
+end
+
+function names = build_feature_names(use_mfcc, mfcc_coeffs)
+    names = { ...
+        'low_freq_ratio', ...
+        'pitch_variance', ...
+        'zcr', ...
+        'energy_variance', ...
+        'spectral_centroid', ...
+        'spectral_flux'};
+    if use_mfcc
+        for i = 1:mfcc_coeffs
+            names{end + 1} = sprintf('mfcc%02d_mean', i);
+        end
+        for i = 1:mfcc_coeffs
+            names{end + 1} = sprintf('mfcc%02d_std', i);
+        end
+    end
+end
+
+function [paths, labels, speakers, splits] = load_from_file_index(index_path)
+    paths = {};
+    labels = [];
+    speakers = {};
+    splits = {};
+    if ~exist(index_path, 'file')
+        return;
+    end
+    opts = detectImportOptions(index_path, 'TextType', 'string');
+    tbl = readtable(index_path, opts);
+    if ~ismember('relative_path', tbl.Properties.VariableNames) || ...
+       ~ismember('label', tbl.Properties.VariableNames)
+        return;
+    end
+    processed_dir = fileparts(fileparts(index_path)); % .../public_dataset/processed
+    root_dir = fullfile(processed_dir, 'wav16k');
+    for i = 1:height(tbl)
+        rel = char(tbl.relative_path(i));
+        full_path = fullfile(root_dir, rel);
+        if ~exist(full_path, 'file')
+            continue;
+        end
+        paths{end + 1, 1} = full_path;
+        labels(end + 1, 1) = strcmpi(tbl.label(i), "shanghai");
+        if ismember('speaker_id', tbl.Properties.VariableNames)
+            speakers{end + 1, 1} = safe_char(tbl.speaker_id(i));
+        else
+            speakers{end + 1, 1} = '';
+        end
+        if ismember('split', tbl.Properties.VariableNames)
+            splits{end + 1, 1} = safe_char(tbl.split(i));
+        else
+            splits{end + 1, 1} = '';
+        end
+    end
+end
+
+function [train_idx, val_idx, test_idx] = split_by_speaker(labels, speakers, ratios, seed)
+    rng(seed);
+    train_idx = false(size(labels));
+    val_idx = false(size(labels));
+    test_idx = false(size(labels));
+    if isempty(speakers)
+        [train_idx, test_idx] = stratified_holdout(labels, ratios(3), seed);
+        val_idx = false(size(labels));
+        return;
+    end
+    classes = unique(labels(:))';
+    for c = classes
+        idx = find(labels == c);
+        spk = speakers(idx);
+        [uniq_spk, ~, spk_idx] = unique(spk);
+        order = randperm(numel(uniq_spk));
+        uniq_spk = uniq_spk(order);
+
+        n = numel(uniq_spk);
+        if n < 3
+            % Not enough speakers for speaker-independent split; fall back to utterance split.
+            idx = idx(randperm(numel(idx)));
+            n_test = max(1, round(numel(idx) * ratios(3)));
+            n_val = max(0, round(numel(idx) * ratios(2)));
+            if n_test + n_val >= numel(idx)
+                n_test = max(1, numel(idx) - 1);
+                n_val = 0;
+            end
+            test_idx(idx(1:n_test)) = true;
+            if n_val > 0
+                val_idx(idx(n_test + 1:n_test + n_val)) = true;
+            end
+            train_idx(idx(n_test + n_val + 1:end)) = true;
+            continue;
+        end
+        n_train = max(1, round(n * ratios(1)));
+        n_val = max(1, round(n * ratios(2)));
+        n_train = min(n_train, n - 2);
+        n_val = min(n_val, n - n_train - 1);
+        n_test = max(1, n - n_train - n_val);
+
+        train_spk = uniq_spk(1:n_train);
+        val_start = n_train + 1;
+        val_end = n_train + n_val;
+        test_start = val_end + 1;
+        test_end = min(n, val_end + n_test);
+        val_spk = uniq_spk(val_start:val_end);
+        test_spk = uniq_spk(test_start:test_end);
+
+        for i = 1:numel(idx)
+            if any(strcmp(spk{i}, train_spk))
+                train_idx(idx(i)) = true;
+            elseif any(strcmp(spk{i}, val_spk))
+                val_idx(idx(i)) = true;
+            else
+                test_idx(idx(i)) = true;
+            end
+        end
+    end
+end
+
+function [train_idx, val_idx, test_idx] = split_from_tags(tags)
+    train_idx = strcmpi(tags, 'train');
+    val_idx = strcmpi(tags, 'val') | strcmpi(tags, 'valid') | strcmpi(tags, 'validation');
+    test_idx = strcmpi(tags, 'test');
+    if ~any(train_idx)
+        train_idx = ~test_idx & ~val_idx;
+    end
+end
+
+function write_splits_to_index(index_path, paths, train_idx, val_idx, test_idx)
+    if ~exist(index_path, 'file')
+        return;
+    end
+    opts = detectImportOptions(index_path, 'TextType', 'string');
+    tbl = readtable(index_path, opts);
+    if ~ismember('split', tbl.Properties.VariableNames)
+        tbl.split = strings(height(tbl), 1);
+    end
+    processed_dir = fileparts(fileparts(index_path));
+    root_dir = fullfile(processed_dir, 'wav16k');
+    rel_paths = strings(height(tbl), 1);
+    for i = 1:height(tbl)
+        rel_paths(i) = tbl.relative_path(i);
+    end
+    rel_from_paths = strings(numel(paths), 1);
+    prefix = [char(root_dir) filesep];
+    for i = 1:numel(paths)
+        p = char(paths{i});
+        if startsWith(p, prefix)
+            rel_from_paths(i) = string(p(numel(prefix)+1:end));
+        else
+            rel_from_paths(i) = string(p);
+        end
+    end
+    for i = 1:numel(paths)
+        idx = find(rel_paths == rel_from_paths(i), 1);
+        if isempty(idx)
+            continue;
+        end
+        if train_idx(i)
+            tbl.split(idx) = "train";
+        elseif val_idx(i)
+            tbl.split(idx) = "val";
+        elseif test_idx(i)
+            tbl.split(idx) = "test";
+        end
+    end
+    writetable(tbl, index_path);
+end
+
+function [Xb, yb, wb] = balance_training_data(X, y, seed)
+    rng(seed);
+    idx_pos = find(y == 1);
+    idx_neg = find(y == 0);
+    if isempty(idx_pos) || isempty(idx_neg)
+        Xb = X;
+        yb = y;
+        wb = compute_sample_weights(y);
+        return;
+    end
+    n = min(numel(idx_pos), numel(idx_neg));
+    idx_pos = idx_pos(randperm(numel(idx_pos), n));
+    idx_neg = idx_neg(randperm(numel(idx_neg), n));
+    idx = [idx_pos; idx_neg];
+    idx = idx(randperm(numel(idx)));
+    Xb = X(idx, :);
+    yb = y(idx);
+    wb = compute_sample_weights(yb);
+end
+
+function weights = compute_sample_weights(labels)
+    weights = ones(size(labels));
+    pos = sum(labels == 1);
+    neg = sum(labels == 0);
+    if pos == 0 || neg == 0
+        return;
+    end
+    w_pos = 0.5 / pos;
+    w_neg = 0.5 / neg;
+    weights(labels == 1) = w_pos;
+    weights(labels == 0) = w_neg;
+end
+
+function generate_publication_figures(params, X_test, y_test, y_pred, scores, model_name, metrics, summaries)
+    reports_dir = fullfile(fileparts(mfilename('fullpath')), 'public_dataset', 'reports', 'publication');
+    if ~exist(reports_dir, 'dir')
+        mkdir(reports_dir);
+    end
+
+    fig_dir = fullfile(reports_dir, 'individual');
+    if ~exist(fig_dir, 'dir')
+        mkdir(fig_dir);
+    end
+
+    palette = struct();
+    palette.blue = [0.56 0.64 0.72];
+    palette.blue_light = [0.86 0.89 0.92];
+    palette.red = [0.68 0.36 0.36];
+    palette.red_light = [0.90 0.82 0.82];
+    palette.gray = [0.55 0.55 0.55];
+    palette.ink = [0.18 0.18 0.18];
+
+    n_test = numel(y_test);
+    n_pos = sum(y_test == 1);
+    n_neg = sum(y_test == 0);
+
+    figA = new_publication_figure();
+    cm = [metrics.tp, metrics.fn; metrics.fp, metrics.tn];
+    cm_sum = max(sum(cm(:)), 1);
+    cm_pct = cm / cm_sum * 100;
+    imagesc(cm_pct);
+    colormap(figA, [1 1 1; 0.93 0.93 0.93; 0.82 0.82 0.82; 0.65 0.65 0.65; 0.40 0.40 0.40]);
+    axis equal tight;
+    set(gca, 'XTick', 1:2, 'XTickLabel', {'Pred Shanghai', 'Pred Other'}, ...
+        'YTick', 1:2, 'YTickLabel', {'Actual Shanghai', 'Actual Other'}, ...
+        'LineWidth', 1.0, 'Box', 'on');
+    ylabel('Ground truth');
+    title('Confusion matrix (test set)', 'FontWeight', 'bold');
+    xline(1.5, '-', 'Color', palette.ink, 'LineWidth', 0.8);
+    yline(1.5, '-', 'Color', palette.ink, 'LineWidth', 0.8);
+    for i = 1:2
+        for j = 1:2
+            text_color = palette.ink;
+            bg_color = [0.98 0.98 0.98];
+            if cm_pct(i, j) >= 35
+                text_color = [1 1 1];
+                bg_color = 'none';
+            end
+            text(j, i, sprintf('%d\n(%.1f%%)', cm(i, j), cm_pct(i, j)), ...
+                'HorizontalAlignment', 'center', 'FontWeight', 'bold', 'Color', text_color, ...
+                'BackgroundColor', bg_color, 'Margin', 2);
+        end
+    end
+    text(1, 0.72, 'TP / FN row', 'HorizontalAlignment', 'center', 'Color', palette.gray, 'FontSize', 12);
+    text(2, 2.28, 'TN cell', 'HorizontalAlignment', 'center', 'Color', [1 1 1], 'FontSize', 12);
+    captionA = sprintf('Figure A | Test-set confusion matrix (N=%d; Shanghai=%d, Non-Shanghai=%d). Values show count and share of the full test set.', ...
+        n_test, n_pos, n_neg);
+    add_caption(figA, captionA);
+    export_publication(figA, fullfile(fig_dir, 'figure_A_confusion_matrix'));
+
+    figB = new_publication_figure();
+    vals = [metrics.accuracy, metrics.precision, metrics.recall, metrics.f1];
+    b = bar(vals, 'FaceColor', palette.blue, 'EdgeColor', 'none');
+    ylim([0 1]);
+    set(gca, 'XTick', 1:4, 'XTickLabel', {'Accuracy', 'Precision', 'Recall', 'F1'});
+    ylabel('Score');
+    title('Test-set performance metrics', 'FontWeight', 'bold');
+    grid on;
+    for i = 1:numel(vals)
+        text(i, vals(i) + 0.03, sprintf('%.3f', vals(i)), ...
+            'HorizontalAlignment', 'center', 'Color', palette.ink, 'FontSize', 12);
+    end
+    [best_val, best_idx_metric] = max(vals);
+    text(best_idx_metric, min(0.97, best_val + 0.10), 'Highest metric', ...
+        'HorizontalAlignment', 'center', 'Color', palette.gray, 'FontSize', 12, 'FontAngle', 'italic');
+    b.FaceAlpha = 0.85;
+    captionB = 'Figure B | Test-set metrics for the selected model.';
+    add_caption(figB, captionB);
+    export_publication(figB, fullfile(fig_dir, 'figure_B_metrics'));
+
+    figC = new_publication_figure();
+    num_feats = min(6, size(X_test, 2));
+    labels = short_feature_labels(params.feature_names(1:num_feats));
+    pos = X_test(y_test == 1, 1:num_feats);
+    neg = X_test(y_test == 0, 1:num_feats);
+    mu_pos = mean(pos, 1, 'omitnan');
+    mu_neg = mean(neg, 1, 'omitnan');
+    bc = bar([mu_pos; mu_neg]', 'grouped');
+    bc(1).FaceColor = palette.blue;
+    bc(1).EdgeColor = 'none';
+    bc(2).FaceColor = palette.red_light;
+    bc(2).EdgeColor = 'none';
+    set(gca, 'XTick', 1:num_feats, 'XTickLabel', labels, 'XTickLabelRotation', 0);
+    legend({'Shanghai', 'Non-Shanghai'}, 'Location', 'northoutside', 'Orientation', 'horizontal');
+    ylabel('Z-scored mean');
+    title('Class-conditional feature means (test set)', 'FontWeight', 'bold');
+    grid on;
+    diffs = abs(mu_pos - mu_neg);
+    [~, dom_idx] = max(diffs);
+    text(dom_idx, max([mu_pos(:); mu_neg(:)]) + 0.04, sprintf('Largest gap: %s', labels{dom_idx}), ...
+        'HorizontalAlignment', 'center', 'Color', palette.gray, 'FontSize', 12, 'FontAngle', 'italic');
+    captionC = 'Figure C | Mean standardized feature values. Labels: LF, PV, ZCR, EV, SC, SF.';
+    add_caption(figC, captionC);
+    export_publication(figC, fullfile(fig_dir, 'figure_C_feature_means'));
+
+    figD = new_publication_figure();
+    hold on;
+    histogram(scores(y_test == 1), 'FaceColor', palette.red, 'FaceAlpha', 0.55, 'EdgeColor', 'none');
+    histogram(scores(y_test == 0), 'FaceColor', palette.blue, 'FaceAlpha', 0.55, 'EdgeColor', 'none');
+    xlabel('Decision score');
+    ylabel('Count');
+    title('Decision score distribution (test set)', 'FontWeight', 'bold');
+    legend({'Shanghai', 'Non-Shanghai'}, 'Location', 'northeast');
+    grid on;
+    xline(0, '--', 'Threshold', 'Color', palette.gray, 'LineWidth', 1.0, ...
+        'LabelVerticalAlignment', 'middle', 'LabelHorizontalAlignment', 'center');
+    captionD = sprintf('Figure D | Distribution of decision scores for Shanghai vs. non-Shanghai test samples (model: %s).', model_name);
+    add_caption(figD, captionD);
+    export_publication(figD, fullfile(fig_dir, 'figure_D_score_distribution'));
+
+    figE = new_publication_figure();
+    model_names = cellfun(@(s) strrep(s.name, '_', '-'), summaries, 'UniformOutput', false);
+    metric_mat = zeros(numel(summaries), 4);
+    for i = 1:numel(summaries)
+        sm = summaries{i};
+        metric_mat(i, :) = [safe_metric(sm.metrics, 'accuracy'), safe_metric(sm.metrics, 'precision'), ...
+            safe_metric(sm.metrics, 'recall'), sm.cv_f1];
+    end
+    bh = bar(metric_mat, 'grouped');
+    compare_colors = [
+        palette.blue;
+        [0.64 0.69 0.74];
+        [0.71 0.62 0.58];
+        [0.77 0.74 0.70]
+    ];
+    for i = 1:numel(bh)
+        bh(i).FaceColor = compare_colors(i, :);
+        bh(i).EdgeColor = 'none';
+    end
+    set(gca, 'XTick', 1:numel(model_names), 'XTickLabel', model_names, 'XTickLabelRotation', 15);
+    ylim([0 1]);
+    ylabel('Score');
+    title('Four-model comparison', 'FontWeight', 'bold');
+    legend({'Acc/ValAcc', 'Prec/ValPrec', 'Rec/ValRec', 'CV F1'}, 'Location', 'northoutside', 'Orientation', 'horizontal');
+    grid on;
+    [~, best_model_idx] = max(metric_mat(:, 4));
+    text(best_model_idx, min(0.97, metric_mat(best_model_idx, 4) + 0.05), 'Best by CV F1', ...
+        'HorizontalAlignment', 'center', 'Color', palette.ink, 'FontSize', 12, 'FontWeight', 'bold');
+    for i = 1:size(metric_mat, 1)
+        text(i, min(0.93, metric_mat(i, 4) + 0.03), sprintf('%.3f', metric_mat(i, 4)), ...
+            'HorizontalAlignment', 'center', 'Color', palette.gray, 'FontSize', 11);
+    end
+    captionE = 'Figure E | Comparison across four candidate models. The final model is selected by validation F1 or cross-validation F1, depending on split availability.';
+    add_caption(figE, captionE);
+    export_publication(figE, fullfile(fig_dir, 'figure_E_model_comparison'));
+end
+
+function print_ingest_stats(stats, total, pos, neg)
+    fprintf('\n=== Ingestion Statistics ===\n');
+    fprintf('Total files scanned: %d\n', total);
+    fprintf('Valid samples: %d (shanghai=%d, non_shanghai=%d)\n', pos + neg, pos, neg);
+    fprintf('Skipped (read_fail): %d\n', stats.read_fail);
+    fprintf('Skipped (too_short): %d\n', stats.too_short);
+    fprintf('Skipped (invalid_feat): %d\n', stats.invalid_feat);
+    if isfield(stats, 'cache_hit')
+        fprintf('Feature cache hits: %d\n', stats.cache_hit);
+        fprintf('Feature cache misses: %d\n', stats.cache_miss);
+    end
+end
+
+function [X, y, paths, speakers, splits] = subsample_by_class(X, y, paths, speakers, splits, max_per_class, seed)
+    if isinf(max_per_class)
+        return;
+    end
+    rng(seed);
+    idx_pos = find(y == 1);
+    idx_neg = find(y == 0);
+    n_pos = min(numel(idx_pos), max_per_class);
+    n_neg = min(numel(idx_neg), max_per_class);
+    idx_pos = idx_pos(randperm(numel(idx_pos), n_pos));
+    idx_neg = idx_neg(randperm(numel(idx_neg), n_neg));
+    idx = [idx_pos; idx_neg];
+    idx = idx(randperm(numel(idx)));
+    X = X(idx, :);
+    y = y(idx);
+    paths = paths(idx);
+    speakers = speakers(idx);
+    splits = splits(idx);
+end
+
+function [train_idx, val_idx, test_idx] = enforce_min_class_counts(labels, train_idx, val_idx, test_idx, min_pos, min_neg, seed)
+    rng(seed);
+    [train_idx, val_idx, test_idx] = ensure_split(train_idx, val_idx, test_idx, labels, min_pos, min_neg);
+end
+
+function [train_idx, val_idx, test_idx] = ensure_split(train_idx, val_idx, test_idx, labels, min_pos, min_neg)
+    % If any split has too few positives/negatives, redo split by label (not speaker).
+    splits = {train_idx, val_idx, test_idx};
+    for i = 1:3
+        mask = splits{i};
+        if sum(mask) == 0
+            [train_idx, val_idx, test_idx] = stratified_three_way(labels, 0.7, 0.15, 0.15);
+            return;
+        end
+        if sum(labels(mask) == 1) < min_pos || sum(labels(mask) == 0) < min_neg
+            [train_idx, val_idx, test_idx] = stratified_three_way(labels, 0.7, 0.15, 0.15);
+            return;
+        end
+    end
+end
+
+function [train_idx, val_idx, test_idx] = stratified_three_way(labels, r_train, r_val, r_test)
+    train_idx = false(size(labels));
+    val_idx = false(size(labels));
+    test_idx = false(size(labels));
+    classes = unique(labels(:))';
+    for c = classes
+        idx = find(labels == c);
+        idx = idx(randperm(numel(idx)));
+        n = numel(idx);
+        n_train = max(1, round(n * r_train));
+        n_val = max(1, round(n * r_val));
+        if n_train + n_val >= n
+            n_train = max(1, n - 2);
+            n_val = 1;
+        end
+        n_test = max(1, n - n_train - n_val);
+        train_idx(idx(1:n_train)) = true;
+        val_idx(idx(n_train + 1:n_train + n_val)) = true;
+        test_idx(idx(n_train + n_val + 1:n_train + n_val + n_test)) = true;
+    end
+end
+
+function audio = trim_silence(audio)
+    if isempty(audio)
+        return;
+    end
+    thr = 0.02 * max(abs(audio));
+    idx = find(abs(audio) > thr);
+    if isempty(idx)
+        return;
+    end
+    audio = audio(idx(1):idx(end));
+end
+
+function feats = compute_mfcc_features(audio, fs, num_coeffs)
+    coeffs = mfcc(audio, fs, 'NumCoeffs', num_coeffs);
+    coeffs = coeffs(~any(isnan(coeffs), 2), :);
+    if isempty(coeffs)
+        feats = zeros(1, num_coeffs * 2);
+        return;
+    end
+    feats = [mean(coeffs, 1), std(coeffs, 0, 1)];
+end
+
+function fig = new_publication_figure()
+    fig = figure('Color', 'w', 'Position', [120, 120, 900, 650], ...
+        'Toolbar', 'figure', 'MenuBar', 'figure', 'NumberTitle', 'off');
+    set(fig, 'DefaultAxesFontName', 'Times New Roman');
+    set(fig, 'DefaultAxesFontSize', 13);
+    set(fig, 'DefaultTextFontName', 'Times New Roman');
+    set(fig, 'DefaultTextFontSize', 13);
+    set(fig, 'DefaultAxesTitleFontSizeMultiplier', 1.05);
+end
+
+function add_caption(fig, text_str)
+    annotation(fig, 'textbox', [0.07 0.015 0.86 0.06], ...
+        'String', text_str, 'EdgeColor', 'none', 'FontSize', 12, ...
+        'FontName', 'Times New Roman', 'Interpreter', 'none');
+end
+
+function export_publication(fig, base_path)
+    ax = findall(fig, 'type', 'axes');
+    for i = 1:numel(ax)
+        try
+            ax(i).Toolbar.Visible = 'on';
+        catch
+        end
+        try
+            enableDefaultInteractivity(ax(i));
+        catch
+        end
+    end
+    drawnow;
+    try
+        exportgraphics(fig, [base_path '.pdf'], 'ContentType', 'vector');
+        exportgraphics(fig, [base_path '.png'], 'Resolution', 300);
+    catch
+        print(fig, [base_path '.pdf'], '-dpdf', '-painters');
+        print(fig, [base_path '.png'], '-dpng', '-r300');
+    end
+end
+
+function labels = short_feature_labels(feature_names)
+    labels = cell(size(feature_names));
+    for i = 1:numel(feature_names)
+        switch feature_names{i}
+            case 'low_freq_ratio'
+                labels{i} = 'LF';
+            case 'pitch_variance'
+                labels{i} = 'PV';
+            case 'zcr'
+                labels{i} = 'ZCR';
+            case 'energy_variance'
+                labels{i} = 'EV';
+            case 'spectral_centroid'
+                labels{i} = 'SC';
+            case 'spectral_flux'
+                labels{i} = 'SF';
+            otherwise
+                labels{i} = feature_names{i};
+        end
+    end
+end
+
+function value = safe_metric(metrics, field_name)
+    value = 0;
+    if isstruct(metrics) && isfield(metrics, field_name)
+        value = metrics.(field_name);
+    end
+    if isempty(value) || isnan(value)
+        value = 0;
+    end
+end
+
+function out = safe_char(value)
+    try
+        if ismissing(value)
+            out = '';
+            return;
+        end
+    catch
+    end
+    if isstring(value)
+        if isempty(value) || (isscalar(value) && ismissing(value))
+            out = '';
+            return;
+        end
+        out = char(value);
+        return;
+    end
+    if ischar(value)
+        out = value;
+        return;
+    end
+    out = char(string(value));
+end
+
+function ok = splits_are_usable(labels, tags, params)
+    [train_idx, val_idx, test_idx] = split_from_tags(tags);
+    ok = split_has_minimums(labels, train_idx, params.min_eval_pos, params.min_eval_neg) && ...
+         split_has_minimums(labels, val_idx, params.min_eval_pos, params.min_eval_neg) && ...
+         split_has_minimums(labels, test_idx, params.min_eval_pos, params.min_eval_neg);
+end
+
+function ok = split_has_minimums(labels, mask, min_pos, min_neg)
+    ok = sum(mask) > 0 && sum(labels(mask) == 1) >= min_pos && sum(labels(mask) == 0) >= min_neg;
+end
+
+function cache = load_feature_cache(cache_path)
+    cache = containers.Map('KeyType', 'char', 'ValueType', 'any');
+    if ~exist(cache_path, 'file')
+        return;
+    end
+    loaded = load(cache_path, 'feature_cache');
+    if isfield(loaded, 'feature_cache') && isa(loaded.feature_cache, 'containers.Map')
+        cache = loaded.feature_cache;
+    end
+end
+
+function save_feature_cache(cache_path, cache)
+    feature_cache = cache; %#ok<NASGU>
+    save(cache_path, 'feature_cache', '-v7.3');
+end
+
+function [feature_vector, status, cache, hit] = get_cached_or_extract_feature(filename, params, cache)
+    key = cache_key_for_file(filename, params);
+    hit = false;
+    if cache.isKey(key)
+        entry = cache(key);
+        feature_vector = entry.feature_vector;
+        status = entry.status;
+        hit = true;
+        return;
+    end
+    [feature_vector, status] = extract_features_from_file(filename, params);
+    cache(key) = struct('feature_vector', feature_vector, 'status', status);
+end
+
+function key = cache_key_for_file(filename, params)
+    info = dir(filename);
+    if isempty(info)
+        key = sprintf('%s|missing|%d|%d', filename, params.use_mfcc, params.mfcc_coeffs);
+        return;
+    end
+    key = sprintf('%s|%.12f|%d|%d|%d', filename, info.datenum, info.bytes, params.use_mfcc, params.mfcc_coeffs);
+end
+
+function out = ternary(cond, a, b)
+    if cond
+        out = a;
+    else
+        out = b;
+    end
+end
