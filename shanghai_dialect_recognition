@@ -1,0 +1,4 @@
+function shanghai_dialect_recognition()
+%SHANGHAI_DIALECT_RECOGNITION_ENGLISH_DEMO English entry point.
+    shanghai_dialect_pipeline();
+end
