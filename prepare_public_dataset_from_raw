@@ -1,4 +1,4 @@
-function prepare_public_dataset_from_raw()
+ function prepare_public_dataset_from_raw()
     % Build a clean, standardized dataset for MATLAB training.
     % Inputs:
     %   public_dataset/raw/shanghai_scripted
@@ -26,6 +26,7 @@ function prepare_public_dataset_from_raw()
     if fid == -1
         error('Failed to open file_index.csv for writing.');
     end
+    close_index = onCleanup(@() fclose(fid));
 
     header = [
         'file_id,relative_path,label,source_dataset,speaker_id,gender,age_group,', ...
@@ -34,6 +35,478 @@ function prepare_public_dataset_from_raw()
     ];
     fprintf(fid, '%s\n', header);
 
+    % Load metadata for Shanghai scripted.
+    scripted_trans = load_uttransinfo(fullfile(scripted_root, 'UTTRANSINFO.txt'));
+    scripted_spkinfo = load_spkinfo(fullfile(scripted_root, 'SPKINFO.txt'));
+
+    % Process Shanghai scripted WAVs.
+    scripted_wavs = dir(fullfile(scripted_root, 'WAV', '**', '*.wav'));
+    for i = 1:numel(scripted_wavs)
+        in_path = fullfile(scripted_wavs(i).folder, scripted_wavs(i).name);
+        base = erase(scripted_wavs(i).name, '.wav');
+        speaker_id = get_speaker_from_base(base);
+
+        [gender, age_group, device] = lookup_spk(scripted_spkinfo, speaker_id);
+        [transcript, prompt] = lookup_trans(scripted_trans, scripted_wavs(i).name);
+
+        out_rel = fullfile('shanghai', 'scripted', speaker_id, ...
+            sprintf('shh_scripted_%s.wav', base));
+        out_path = fullfile(out_root, out_rel);
+        ensure_dir(fileparts(out_path));
+
+        [dur, sample_rate, channels] = write_audio_standardized(in_path, out_path, 16000);
+
+        write_index_row(fid, ...
+            sprintf('shh_scripted_%s', base), out_rel, 'shanghai', 'ASR-SCShhiDiaDuSC', ...
+            speaker_id, gender, age_group, 'scripted', 'Shanghainese', device, 'unknown', ...
+            sample_rate, channels, dur, transcript, prompt, 'CC BY-NC-ND 4.0', ...
+            'https://magichub.com/datasets/shanghai-dialect-scripted-speech-corpus-daily-use-sentence/', ...
+            '');
+    end
+
+    % Load metadata for Shanghai conversational.
+    conv_spkinfo = load_spkinfo(fullfile(conv_root, 'SPKINFO.txt'));
+
+    % Conversation releases may place WAV files in subfolders.
+    conv_wavs = dir(fullfile(conv_root, 'WAV', '**', '*.wav'));
+    for i = 1:numel(conv_wavs)
+        in_path = fullfile(conv_wavs(i).folder, conv_wavs(i).name);
+        base = erase(conv_wavs(i).name, '.wav');
+        speaker_id = get_conversation_speaker(base);
+
+        [gender, age_group, device] = lookup_spk(conv_spkinfo, speaker_id);
+        transcript = read_conversation_transcript(fullfile(conv_root, 'TXT', [base '.txt']));
+
+        out_rel = fullfile('shanghai', 'conversational', speaker_id, ...
+            sprintf('shh_conv_%s.wav', base));
+        out_path = fullfile(out_root, out_rel);
+        ensure_dir(fileparts(out_path));
+
+        [dur, sample_rate, channels] = write_audio_standardized(in_path, out_path, 16000);
+
+        write_index_row(fid, ...
+            sprintf('shh_conv_%s', base), out_rel, 'shanghai', 'ASR-CShhiDiaCSC', ...
+            speaker_id, gender, age_group, 'conversational', 'Shanghainese', device, 'unknown', ...
+            sample_rate, channels, dur, transcript, '', 'CC BY-NC-ND 4.0', ...
+            'https://magichub.com/datasets/shanghai-dialect-conversational-speech-corpus/', ...
+            '');
+    end
+
+    % Load Primewords transcript map.
+    prime_trans = load_primewords_json(fullfile(prime_root, 'set1_transcript.json'));
+    prime_wavs = dir(fullfile(prime_root, 'audio_files', '**', '*.wav'));
+    for i = 1:numel(prime_wavs)
+        in_path = fullfile(prime_wavs(i).folder, prime_wavs(i).name);
+        base = erase(prime_wavs(i).name, '.wav');
+        [transcript, user_id] = lookup_primewords(prime_trans, prime_wavs(i).name);
+        if isempty(user_id)
+            user_id = 'unknown';
+        end
+
+        out_rel = fullfile('non_shanghai', 'primewords', user_id, ...
+            sprintf('pwords_%s.wav', base));
+        out_path = fullfile(out_root, out_rel);
+        ensure_dir(fileparts(out_path));
+
+        [dur, sample_rate, channels] = write_audio_standardized(in_path, out_path, 16000);
+
+        write_index_row(fid, ...
+            sprintf('pwords_%s', base), out_rel, 'non_shanghai', 'Primewords', ...
+            user_id, '', '', 'read', '', '', 'unknown', ...
+            sample_rate, channels, dur, transcript, '', 'CC BY-NC-ND 4.0', ...
+            'https://www.openslr.org/47/', ...
+            '');
+    end
+
+    % Include the small hand-collected examples shipped with this project.
+    % Their speaker identities are unknown; the training code keeps each clip
+    % separate and reports this limitation rather than claiming speaker holdout.
+    process_local_training_data(fid, root_dir, out_root);
+
+    % Optional THCHS-30 subset downloaded next to this repository.
+    thchs_root = fullfile(fileparts(root_dir), 'thchs30-subset-large');
+    if exist(thchs_root, 'dir')
+        process_thchs_subset(fid, thchs_root, out_root);
+    end
+
+    % The downloaded Hugging Face Parquet file embeds WAV bytes. Native nested
+    % Parquet import requires MATLAB R2022b or newer. No network access is used.
+    parquet_files = dir(fullfile(root_dir, 'train-*.parquet'));
+    if ~isempty(parquet_files) && exist('parquetread','file') ~= 2
+        warning('Skipping embedded Parquet audio: parquetread is unavailable. Other sources will still be prepared.');
+    else
+        for i = 1:numel(parquet_files)
+            process_hf_parquet(fid, parquet_files(i).name, parquet_files(i).folder, out_root);
+        end
+    end
+
+    clear close_index;
+    fprintf('Dataset preparation complete.\n');
+    fprintf('Index file: %s\n', index_path);
+end
+
+function process_local_training_data(fid, root_dir, out_root)
+    local_root = fullfile(root_dir, 'training_data');
+    classes = {'shanghai','non_shanghai'};
+    for c = 1:numel(classes)
+        class_root = fullfile(local_root, classes{c});
+        wavs = dir(fullfile(class_root, '**', '*'));
+        for i = 1:numel(wavs)
+            [~,~,ext] = fileparts(wavs(i).name);
+            if ~strcmpi(ext,'.wav'), continue; end
+            in_path = fullfile(wavs(i).folder,wavs(i).name);
+            [~,base] = fileparts(wavs(i).name);
+            safe = sanitize_field(base);
+            label = classes{c};
+            rel = fullfile(label,'local',sprintf('local_%s_%s.wav',label,safe));
+            out = fullfile(out_root,rel); ensure_dir(fileparts(out));
+            [dur,fs,ch] = write_audio_standardized(in_path,out,16000);
+            write_index_row(fid,sprintf('local_%s_%s',label,safe),rel,label, ...
+                'local_training_data','unknown','','','unknown','unknown','unknown','unknown', ...
+                fs,ch,dur,'','','user-provided; license unknown','', '');
+            if any(strcmpi(base,{'biaozhun','bubiaozhun'}))
+                warning('Ambiguous local label for %s; verify whether it belongs in %s.',base,label);
+            end
+        end
+    end
+end
+
+function process_thchs_subset(fid, thchs_root, out_root)
+    wavs = dir(fullfile(thchs_root, '**', '*.wav'));
+    fprintf('Importing %d THCHS-30 Mandarin clips from %s\n',numel(wavs),thchs_root);
+    for i = 1:numel(wavs)
+        in_path = fullfile(wavs(i).folder,wavs(i).name);
+        [~,speaker_id] = fileparts(wavs(i).folder);
+        [~,base] = fileparts(wavs(i).name);
+        if isempty(speaker_id)
+            token = regexp(base,'^([A-Za-z]+\d+)_','tokens','once');
+            if isempty(token), speaker_id='unknown'; else, speaker_id=token{1}; end
+        end
+        safe_speaker = sanitize_field(speaker_id);
+        safe_base = sanitize_field(base);
+        rel = fullfile('non_shanghai','THCHS30',safe_speaker, ...
+            sprintf('thchs_%s.wav',safe_base));
+        out = fullfile(out_root,rel); ensure_dir(fileparts(out));
+        [dur,fs,ch] = write_audio_standardized(in_path,out,16000);
+        write_index_row(fid,sprintf('thchs_%s',safe_base),rel,'non_shanghai', ...
+            'THCHS-30',speaker_id,'','','read','Mandarin','unknown','unknown', ...
+            fs,ch,dur,'','','Apache-2.0','https://www.openslr.org/18/','');
+        if mod(i,500)==0, fprintf('  THCHS-30 clips %d/%d\n',i,numel(wavs)); end
+    end
+end
+
+function process_hf_parquet(fid, filename, folder, out_root)
+    parquet_path = fullfile(folder,filename);
+    if exist('parquetread','file') ~= 2
+        error(['MATLAB parquetread is unavailable. This project Parquet import needs ' ...
+            'MATLAB R2022b or newer (nested Parquet support).']);
+    end
+    try
+        T = parquetread(parquet_path);
+    catch ME
+        error('Cannot read nested audio from %s: %s',filename,ME.message);
+    end
+    if ~ismember('audio',T.Properties.VariableNames) || ...
+            ~ismember('speaker_id',T.Properties.VariableNames)
+        error('Unexpected Parquet schema in %s; expected audio and speaker_id columns.',filename);
+    end
+    fprintf('Importing %d embedded Shanghai audio clips from %s\n',height(T),filename);
+    for i = 1:height(T)
+        bytes = nested_value(T.audio,'bytes',i);
+        if isempty(bytes), continue; end
+        source_name = nested_value(T.audio,'path',i);
+        source_name = text_value(source_name);
+        [~,base] = fileparts(source_name);
+        if isempty(base), base = sprintf('utt_%06d',i); end
+        speaker_id = text_value(T.speaker_id(i));
+        if isempty(speaker_id), speaker_id='unknown'; end
+        gender=''; transcript='';
+        if ismember('gender',T.Properties.VariableNames), gender=text_value(T.gender(i)); end
+        if ismember('transcription',T.Properties.VariableNames), transcript=text_value(T.transcription(i)); end
+        safe = sanitize_field(base);
+        rel = fullfile('shanghai','hf_conversational',sanitize_field(speaker_id), ...
+            sprintf('hf_%s.wav',safe));
+        out = fullfile(out_root,rel); ensure_dir(fileparts(out));
+        tmp = [tempname '.wav']; tmpfid = fopen(tmp,'wb');
+        if tmpfid < 0, error('Cannot create temporary WAV for Parquet row %d.',i); end
+        fwrite(tmpfid,uint8(bytes),'uint8'); fclose(tmpfid);
+        cleanup = onCleanup(@()delete_if_exists(tmp)); %#ok<NASGU>
+        [dur,fs,ch] = write_audio_standardized(tmp,out,16000);
+        write_index_row(fid,sprintf('hf_%s',safe),rel,'shanghai', ...
+            'HF-Shanghai-Conversation',speaker_id,gender,'','conversational', ...
+            'Shanghainese','mobile','unknown',fs,ch,dur,transcript,'', ...
+            'CC BY-NC-ND 4.0', ...
+            'https://huggingface.co/datasets/TingChen-ppmc/Shanghai_Dialect_Conversational_Speech_Corpus','');
+        clear cleanup;
+        if mod(i,500)==0, fprintf('  Parquet clips %d/%d\n',i,height(T)); end
+    end
+end
+
+function value = nested_value(container, field, row)
+    if istable(container)
+        col = container.(field);
+    elseif isstruct(container)
+        col = {container.(field)};
+    elseif iscell(container)
+        item = container{row};
+        if istable(item), col=item.(field); value=col{1}; return; end
+        if isstruct(item), value=item.(field); return; end
+        error('Unsupported nested Parquet audio representation.');
+    else
+        error('Unsupported nested Parquet audio representation.');
+    end
+    if iscell(col), value=col{row}; else, value=col(row,:); end
+end
+
+function value = text_value(value)
+    if iscell(value), value=value{1}; end
+    if ismissing(string(value)), value=''; else, value=char(string(value)); end
+end
+
+function delete_if_exists(pathname)
+    if exist(pathname,'file'), delete(pathname); end
+end
+
+function ensure_dir(pathname)
+    if ~exist(pathname, 'dir')
+        mkdir(pathname);
+    end
+end
+
+function [dur, sample_rate, channels] = write_audio_standardized(in_path, out_path, target_fs)
+    [audio, fs] = audioread(in_path);
+    if size(audio, 2) > 1
+        audio = mean(audio, 2);
+    end
+    if fs ~= target_fs
+        if exist('resample','file') == 2
+            audio = resample(audio, target_fs, fs);
+        else
+            warning('resample is unavailable; using linear interpolation for %s.',in_path);
+            t = (0:numel(audio)-1)' / fs;
+            audio = interp1(t,audio,(0:1/target_fs:t(end))','linear','extrap');
+        end
+        fs = target_fs;
+    end
+    audiowrite(out_path, audio, fs);
+    dur = numel(audio) / fs;
+    sample_rate = fs;
+    channels = 1;
+end
+
+function spkinfo = load_spkinfo(pathname)
+    spkinfo = struct();
+    if ~exist(pathname, 'file')
+        return;
+    end
+    opts = detectImportOptions(pathname, 'Delimiter', '\t');
+    opts.PreserveVariableNames = true;
+    tbl = readtable(pathname, opts);
+    for i = 1:height(tbl)
+        spk = string(tbl.("SPEAKER_ID")(i));
+        gender = string(tbl.("GENDER")(i));
+        age = tbl.("AGE")(i);
+        device = string(tbl.("DEVICE")(i));
+
+        spkinfo.(char(spk)) = struct( ...
+            'gender', normalize_gender(char(gender)), ...
+            'age_group', age_to_group(age), ...
+            'device', char(device));
+    end
+end
+
+function transinfo = load_uttransinfo(pathname)
+    transinfo = struct();
+    if ~exist(pathname, 'file')
+        return;
+    end
+    opts = detectImportOptions(pathname, 'Delimiter', '\t');
+    opts.PreserveVariableNames = true;
+    tbl = readtable(pathname, opts);
+    for i = 1:height(tbl)
+        utt = char(tbl.("UTTRANS_ID")(i));
+        prompt = char(tbl.("PROMPT")(i));
+        trans = char(tbl.("TRANSCRIPTION")(i));
+        transinfo.(sanitize_field(utt)) = struct('prompt', prompt, 'trans', trans);
+    end
+end
+
+function [gender, age_group, device] = lookup_spk(spkinfo, speaker_id)
+    gender = '';
+    age_group = '';
+    device = '';
+    if isfield(spkinfo, speaker_id)
+        entry = spkinfo.(speaker_id);
+        gender = entry.gender;
+        age_group = entry.age_group;
+        device = entry.device;
+    end
+end
+
+function [transcript, prompt] = lookup_trans(transinfo, utt_name)
+    transcript = '';
+    prompt = '';
+    key = sanitize_field(utt_name);
+    if isfield(transinfo, key)
+        entry = transinfo.(key);
+        transcript = entry.trans;
+        prompt = entry.prompt;
+    end
+end
+
+function speaker_id = get_speaker_from_base(base)
+    % Example: G0009_0_S0003 -> G0009
+    parts = split(base, '_');
+    speaker_id = char(parts(1));
+end
+
+function speaker_id = get_conversation_speaker(base)
+    % Example: A1137_S0007_0_G1273_G1274 -> G1273_G1274
+    parts = split(base, '_');
+    if numel(parts) >= 5
+        speaker_id = char(strjoin(parts(end-1:end), '_'));
+    else
+        speaker_id = char(base);
+    end
+end
+
+function transcript = read_conversation_transcript(pathname)
+    transcript = '';
+    if ~exist(pathname, 'file')
+        return;
+    end
+    txt = fileread(pathname);
+    transcript = strtrim(txt);
+end
+
+function data = load_primewords_json(pathname)
+    data = containers.Map('KeyType', 'char', 'ValueType', 'any');
+    if ~exist(pathname, 'file')
+        return;
+    end
+    raw = fileread(pathname);
+    decoded = jsondecode(raw);
+    entries = normalize_primewords_entries(decoded);
+    for i = 1:numel(entries)
+        entry = entries{i};
+        if ~isstruct(entry) || ~isfield(entry, 'file')
+            continue;
+        end
+        key = char(entry.file);
+        data(key) = entry;
+    end
+end
+
+function [transcript, user_id] = lookup_primewords(data, filename)
+    transcript = '';
+    user_id = '';
+    if isempty(data)
+        return;
+    end
+    key = char(filename);
+    if data.isKey(key)
+        entry = data(key);
+        if isfield(entry, 'text')
+            transcript = char(entry.text);
+        end
+        if isfield(entry, 'user_id')
+            user_id = char(entry.user_id);
+        end
+    end
+end
+
+function entries = normalize_primewords_entries(decoded)
+    entries = {};
+    if isempty(decoded)
+        return;
+    end
+
+    if iscell(decoded)
+        entries = decoded;
+        return;
+    end
+
+    if isstruct(decoded)
+        if numel(decoded) > 1
+            entries = arrayfun(@(x) x, decoded, 'UniformOutput', false);
+            return;
+        end
+        if isfield(decoded, 'data')
+            if iscell(decoded.data)
+                entries = decoded.data;
+            elseif isstruct(decoded.data)
+                entries = arrayfun(@(x) x, decoded.data, 'UniformOutput', false);
+            end
+            return;
+        end
+        entries = {decoded};
+        return;
+    end
+end
+
+function g = normalize_gender(g)
+    if strcmpi(g, 'F')
+        g = 'female';
+    elseif strcmpi(g, 'M')
+        g = 'male';
+    else
+        g = '';
+    end
+end
+
+function group = age_to_group(age)
+    group = '';
+    if isempty(age) || isnan(age)
+        return;
+    end
+    if age < 18
+        group = 'teen';
+    elseif age < 30
+        group = 'young_adult';
+    elseif age < 50
+        group = 'adult';
+    else
+        group = 'senior';
+    end
+end
+
+function write_index_row(fid, file_id, rel_path, label, source_dataset, speaker_id, gender, age_group, ...
+        speech_style, subdialect, recording_device, recording_condition, sample_rate, channels, duration_sec, ...
+        transcript, transcript_mandarin, license, source_url, split)
+    values = {
+        file_id, rel_path, label, source_dataset, speaker_id, gender, age_group, ...
+        speech_style, subdialect, recording_device, recording_condition, ...
+        num2str(sample_rate), num2str(channels), sprintf('%.3f', duration_sec), ...
+        transcript, transcript_mandarin, license, source_url, split
+    };
+    for i = 1:numel(values)
+        if i > 1
+            fprintf(fid, ',');
+        end
+        fprintf(fid, '%s', csv_escape(values{i}));
+    end
+    fprintf(fid, '\n');
+end
+
+function out = csv_escape(val)
+    if isempty(val)
+        out = '';
+        return;
+    end
+    if ~ischar(val)
+        val = char(string(val));
+    end
+    val = strrep(val, '"', '""');
+    if contains(val, ',') || contains(val, '"') || contains(val, newline)
+        out = ['"' val '"'];
+    else
+        out = val;
+    end
+end
+
+function key = sanitize_field(name)
+    key = regexprep(name, '[^a-zA-Z0-9_]', '_');
+end
     % Load metadata for Shanghai scripted.
     scripted_trans = load_uttransinfo(fullfile(scripted_root, 'UTTRANSINFO.txt'));
     scripted_spkinfo = load_spkinfo(fullfile(scripted_root, 'SPKINFO.txt'));
