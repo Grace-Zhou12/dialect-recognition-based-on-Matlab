@@ -1,5 +1,4 @@
 # dialect-recognition-based-on-Matlab
-# Shanghainese Dialect Recognition (MATLAB)
 
 An interpretable, lightweight **audio clip classifier** for distinguishing Shanghainese speech from non-Shanghainese Mandarin. The MATLAB workflow prepares WAV data, extracts hand-designed acoustic features, compares four classifiers, tunes thresholds on a validation split, and evaluates the selected model on a held-out speaker split.
 
